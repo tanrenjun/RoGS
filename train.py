@@ -31,6 +31,7 @@ from utils.image import render_semantic, remap_semantic
 from utils.render import render, render_blocks
 from utils.visualizer import loss2color, depth2color, CustomPointVisualizer
 from models.road import Road
+from models.adaptive_road_v2 import AdaptiveRoadV2
 from models.loss import L1MaskedLoss, CELossWithMask
 from models.exposure_model import ExposureModel
 from models.gaussian_model import GaussianModel2D
@@ -132,7 +133,15 @@ def train(configs):
     dataset = Dataset(dataset_cfg, use_label=opt.seg_loss_weight > 0, use_depth=opt.depth_loss_weight > 0)
 
     logger.info(f"Dataset cameras_extent: {dataset.cameras_extent} - size: {len(dataset)}")
-    road = Road(model_cfg, dataset, device=device, vis=train_cfg.vis and GUI_FLAG)
+    
+    # Choose between fixed grid or adaptive grid
+    use_adaptive_grid = model_cfg.get("use_adaptive_grid", False)
+    if use_adaptive_grid:
+        logger.info("使用自适应网格（KD-tree V2）初始化Road")
+        road = AdaptiveRoadV2(model_cfg, dataset, device=device, vis=train_cfg.vis and GUI_FLAG)
+    else:
+        logger.info("使用固定网格初始化Road")
+        road = Road(model_cfg, dataset, device=device, vis=train_cfg.vis and GUI_FLAG)
 
     logger.info(f"Road min_xy: {road.min_xy} - max_xy: {road.max_xy}")
     logger.info(f"bev_x_length: {road.bev_x_length} - bev_y_length: {road.bev_y_length}")

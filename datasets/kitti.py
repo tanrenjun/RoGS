@@ -9,55 +9,124 @@ from datasets.base import BaseDataset
 
 
 def get_camxx2cam0(project_matrix, R0_rect):
+    """
+    计算从任意相机到cam0相机的变换矩阵
+    
+    在KITTI数据集中，不同相机之间需要坐标变换。
+    这个函数计算从其他相机（cam2, cam3）到参考相机cam0的变换。
+    
+    Args:
+        project_matrix: 投影矩阵 P2 或 P3 (3, 4)
+        R0_rect: 矩形化旋转矩阵 (3, 3)
+        
+    Returns:
+        np.ndarray: 变换矩阵 T_camxx2cam0 (4, 4)
+    """
+    # 构建cam0到camxx的变换矩阵
     T_cam0tocamxx = np.eye(4)
     T_cam0tocamxx[:3, :3] = R0_rect
     T_cam0tocamxx[:3, 3:4] = np.linalg.inv(project_matrix[:3, :3]) @ project_matrix[:, 3:4]
+    
+    # 返回逆变换：camxx到cam0
     T_camxx2cam0 = np.linalg.inv(T_cam0tocamxx)
     return T_camxx2cam0
 
 
 def read_kitti_calib(calib_path):
+    """
+    读取KITTI标定文件
+    
+    解析KITTI数据集的标定文件，提取相机内参、外参等参数。
+    标定文件包含P2(左相机)、P3(右相机)、R0_rect(矩形化旋转)等参数。
+    
+    Args:
+        calib_path: 标定文件路径
+        
+    Returns:
+        dict: 包含各种标定参数的字典
+              - K2, K3: 左右相机内参矩阵
+              - T_cam2tocam0, T_cam3tocam0: 相机到cam0的变换矩阵
+              - Tr_velo2cam0: LiDAR到相机的变换矩阵
+              - Tr_imu2velo: IMU到LiDAR的变换矩阵
+    """
     with open(calib_path, "r") as f:
         lines = f.readlines()
-    P2 = np.array([float(x) for x in lines[2].strip().split(" ")[1:]]).reshape(3, 4)
-    P3 = np.array([float(x) for x in lines[3].strip().split(" ")[1:]]).reshape(3, 4)
-    R0_rect = np.array([float(x) for x in lines[4].strip().split(" ")[1:]]).reshape(3, 3)
-    Tr_velo2cam0 = np.array([float(x) for x in lines[5].strip().split(" ")[1:]]).reshape(3, 4)
-    Tr_imu2velo = np.array([float(x) for x in lines[6].strip().split(" ")[1:]]).reshape(3, 4)
+    
+    # 解析各行标定数据
+    P2 = np.array([float(x) for x in lines[2].strip().split(" ")[1:]]).reshape(3, 4)  # 左相机投影矩阵
+    P3 = np.array([float(x) for x in lines[3].strip().split(" ")[1:]]).reshape(3, 4)  # 右相机投影矩阵
+    R0_rect = np.array([float(x) for x in lines[4].strip().split(" ")[1:]]).reshape(3, 3)  # 矩形化旋转矩阵
+    Tr_velo2cam0 = np.array([float(x) for x in lines[5].strip().split(" ")[1:]]).reshape(3, 4)  # LiDAR到相机变换
+    Tr_imu2velo = np.array([float(x) for x in lines[6].strip().split(" ")[1:]]).reshape(3, 4)  # IMU到LiDAR变换
 
+    # 转换为4x4齐次坐标矩阵
     Tr_velo2cam0 = np.vstack([Tr_velo2cam0, np.array([0, 0, 0, 1])])
     Tr_imu2velo = np.vstack([Tr_imu2velo, np.array([0, 0, 0, 1])])
 
+    # 提取相机内参
     K2 = P2[:3, :3]
     K3 = P3[:3, :3]
+    
+    # 计算相机间变换矩阵
     Tr_cam2tocam0 = get_camxx2cam0(P2, R0_rect)
     Tr_cam3tocam0 = get_camxx2cam0(P3, R0_rect)
+    
     calib = {"K2": K2, "K3": K3, "T_cam2tocam0": Tr_cam2tocam0, "T_cam3tocam0": Tr_cam3tocam0, "Tr_velo2cam0": Tr_velo2cam0, "Tr_imu2velo": Tr_imu2velo}
 
     return calib
 
 
-IMU_HEIGHT = 0.93
-VEL_HEIGHT = 1.73
+# 传感器高度常量
+IMU_HEIGHT = 0.93  # IMU传感器高度（米）
+VEL_HEIGHT = 1.73  # LiDAR传感器高度（米）
 
 
 class KittiDataset(BaseDataset):
+    """
+    KITTI道路重建数据集类
+    
+    继承自BaseDataset，专门处理KITTI Odometry数据集。
+    相比nuScenes，KITTI的配置更简化，主要使用前向相机(image_2)。
+    支持语义分割标签，但不支持深度信息。
+    """
+    
     def __init__(self, configs, use_label, use_depth):
-        super().__init__()
-        self.resized_image_size = (configs["image_width"], configs["image_height"])
-        self.base_dir = configs["base_dir"]
-        self.image_dir = configs["image_dir"]
-        self.pose_dir = configs["pose_dir"]
-        self.sequence = configs["sequence"]
-        self.camera_names = configs["camera_names"]  # image_2 or image_3
+        """
+        初始化KITTI数据集
+        
+        执行完整的数据加载和预处理流程，包括：
+        - 读取标定文件
+        - 处理姿态数据
+        - 加载图像和语义标签
+        - 执行数据验证
+        
+        Args:
+            configs: 配置字典，包含数据集路径、序列信息等
+            use_label: 是否使用语义标签（KITTI中总是True）
+            use_depth: 是否使用深度信息（KITTI中总是False）
+        """
+        super().__init__()  # 调用基类初始化
+        
+        # 保存配置参数
+        self.resized_image_size = (configs["image_width"], configs["image_height"])  # 图像尺寸
+        self.base_dir = configs["base_dir"]  # 数据集基础目录
+        self.image_dir = configs["image_dir"]  # 图像目录
+        self.pose_dir = configs["pose_dir"]  # 姿态数据目录
+        self.sequence = configs["sequence"]  # 序列号（如"00", "01"等）
+        self.camera_names = configs["camera_names"]  # 相机名称列表（通常为["image_2"]）
 
+        # 读取标定文件
         calib_file = os.path.join(self.base_dir, "sequences", self.sequence, "calib", "000000.txt")
         calib = read_kitti_calib(calib_file)
+        
+        # 使用固定的相机内参（KITTI标准内参）
         self.intrinsic = np.asarray([
             [7.188560000000e+02, 0.000000000000e+00, 6.071928000000e+02],
             [0.000000000000e+00, 7.188560000000e+02, 1.852157000000e+02],
             [0.000000000000e+00, 0.000000000000e+00, 1.000000000000e+00]
-        ], dtype=np.float32)  # image_2
+        ], dtype=np.float32)  # image_2内参
+        
+        # 相机间变换矩阵（cam0到其他相机的变换）
         self.cam0tocam2 = np.asarray([[9.999758e-01, -5.267463e-03, -4.552439e-03, 5.956621e-02],
                                       [5.251945e-03, 9.999804e-01, -3.413835e-03, 2.900141e-04],
                                       [4.570332e-03, 3.389843e-03, 9.999838e-01, 2.577209e-03],
@@ -66,52 +135,71 @@ class KittiDataset(BaseDataset):
                                       [-1.704422e-02, 9.998531e-01, -1.809756e-03, 5.551470e-03],
                                       [2.427880e-02, 2.223358e-03, 9.997028e-01, -5.250882e-03],
                                       [0.0, 0.0, 0.0, 1.0]], dtype=np.float32)
+        
+        # 计算逆变换（其他相机到cam0）
         cam3tocam0 = np.linalg.inv(self.cam0tocam3)
         cam2tocam0 = np.linalg.inv(self.cam0tocam2)
         self.camxx2cam0 = {"image_2": cam2tocam0, "image_3": cam3tocam0}
 
-        # self.camxx2cam0 = {"image_2": calib["T_cam2tocam0"], "image_3": calib["T_cam3tocam0"]}
-
+        # 加载和处理姿态数据
         pose_file = os.path.join(self.pose_dir, "dataset", "poses", f"{self.sequence}.txt")
         cam0_poses = np.loadtxt(pose_file).reshape((-1, 3, 4))  # (N, 3, 4)
+        # 转换为4x4齐次坐标
         cam0_poses = np.concatenate([cam0_poses, np.repeat(np.array([[[0, 0, 0, 1]]]), cam0_poses.shape[0], axis=0)], axis=1)
-        vel_pose = cam0_poses @ calib["Tr_velo2cam0"][None]
-        imu_pose = vel_pose @ calib["Tr_imu2velo"][None]
+        
+        # 坐标变换链：cam0 -> velo -> imu -> chassis
+        vel_pose = cam0_poses @ calib["Tr_velo2cam0"][None]  # cam0到velo
+        imu_pose = vel_pose @ calib["Tr_imu2velo"][None]    # velo到imu
+        
+        # 车辆底盘变换（考虑高度差异）
         Tr_car2vel = np.eye(4)
-        Tr_car2vel[2, 3] = -VEL_HEIGHT
-        chassis_pose = vel_pose @ Tr_car2vel[None]
+        Tr_car2vel[2, 3] = -VEL_HEIGHT  # 减去LiDAR高度
+        chassis_pose = vel_pose @ Tr_car2vel[None]  # velo到底盘
 
+        # 参考位姿归一化
         self.ref_pose = chassis_pose[0]
         inv_ref_pose = np.linalg.inv(self.ref_pose)
         chassis2world_unique = inv_ref_pose @ chassis_pose
         cam0_poses = inv_ref_pose @ cam0_poses
 
-        chassis_xy = chassis2world_unique[:, :2, 3]  # (N, 2)
-
-        index = cam0_poses.shape[0] + 1
+        # 轨迹长度限制
+        chassis_xy = chassis2world_unique[:, :2, 3]  # (N, 2) xy坐标
+        index = cam0_poses.shape[0] + 1  # 默认使用所有数据
+        
+        # X方向长度限制
         if configs["max_x_length"] > 0:
             indexs = np.where(chassis_xy[:, 0] > configs["max_x_length"])[0]
             if len(indexs) > 0:
                 index = min(indexs[0], index)
+        
+        # Y方向长度限制
         if configs["max_y_length"] > 0:
             indexs = np.where(chassis_xy[:, 1] > configs["max_y_length"])[0]
             if len(indexs) > 0:
                 index = min(indexs[0], index)
 
+        # 保存限制后的位姿数据
         self.chassis2world_unique = chassis2world_unique[:index]  # (N, 4, 4)
 
+        # 加载图像和标签数据
         for camera_idx, camera_name in enumerate(self.camera_names):
+            # 获取该相机的文件列表
             file_names = os.listdir(os.path.join(self.base_dir, "sequences", self.sequence, camera_name))
-            file_names.sort(key=lambda x: int(x[:-4]))
+            file_names.sort(key=lambda x: int(x[:-4]))  # 按帧号排序
 
+            # 生成路径列表
             image_paths = [os.path.join("sequences", self.sequence, camera_name, file_name) for file_name in file_names]
             label_paths = [os.path.join("seg_sequences", self.sequence, camera_name, file_name.replace(".jpg", ".png")) for file_name in file_names]
+            
+            # 计算相机到世界的变换
             camera2world = cam0_poses @ self.camxx2cam0[camera_name][None]  # (N, 4, 4)
 
+            # 应用长度限制
             image_paths = image_paths[:index]
             label_paths = label_paths[:index]
             camera2world = camera2world[:index]
 
+            # 添加到数据集
             num_cameras = len(image_paths)
             self.camera2world_all.extend([pose for pose in camera2world])
             self.cameras_K_all.extend([self.intrinsic] * num_cameras)
@@ -119,11 +207,14 @@ class KittiDataset(BaseDataset):
             self.image_filenames_all.extend(image_paths)
             self.label_filenames_all.extend(label_paths)
 
+        # 执行数据检查
         self.file_check()
 
+        # 转换为numpy数组
         self.camera2world_all = np.array(self.camera2world_all)  # [N, 4, 4]
-        self.road_pointcloud = None
+        self.road_pointcloud = None  # KITTI没有地面真实点云
 
+        # 计算NeRF++归一化参数
         nerf_normalization = self.getNerfppNorm()
         self.cameras_extent = nerf_normalization["radius"]
 
@@ -200,40 +291,73 @@ class KittiDataset(BaseDataset):
         return mask, label
 
     def __getitem__(self, idx):
+        """
+        获取指定索引的训练样本
+        
+        KITTI数据集的样本获取函数，相比nuScenes更简单：
+        - 裁剪40%的天空部分（比nuScenes的50%更少）
+        - 总是包含语义标签
+        - 不包含深度信息
+        
+        Args:
+            idx: 样本索引
+            
+        Returns:
+            dict: 包含以下键的训练样本字典
+                  - "image": 归一化后的RGB图像 (H, W, 3)
+                  - "idx": 样本索引
+                  - "cam_idx": 相机索引
+                  - "mask": 道路掩码 (H, W)
+                  - "label": 重映射后的语义标签 (H, W)
+                  - "image_name": 图像文件名
+                  - "R": 相机外参的旋转矩阵 (3, 3)
+                  - "T": 相机外参的平移向量 (3,)
+                  - "K": 调整后的相机内参 (3, 3)
+                  - "W": 图像宽度
+                  - "H": 图像高度
+        """
+        # 获取基本相机信息
         cam_idx = self.cameras_idx_all[idx]
         cam2world = self.camera2world_all[idx]
         K = self.cameras_K_all[idx]
 
+        # 加载图像
         image_path = os.path.join(self.base_dir, self.image_filenames_all[idx])
         image_name = os.path.basename(image_path).split(".")[0]
         input_image = cv2.imread(image_path)
 
-        crop_cy = int(self.resized_image_size[1] * 0.4)
+        # 图像预处理：裁剪天空部分和缩放（KITTI裁剪40%，比nuScenes的50%少）
+        crop_cy = int(self.resized_image_size[1] * 0.4)  # 裁剪行数
         origin_image_size = input_image.shape
         resized_image = cv2.resize(input_image, dsize=self.resized_image_size, interpolation=cv2.INTER_LINEAR)
-        resized_image = cv2.cvtColor(resized_image, cv2.COLOR_BGR2RGB)
-        resized_image = resized_image[crop_cy:, :, :]  # crop the sky
-        gt_image = (np.asarray(resized_image) / 255.0).astype(np.float32)  # [H, W, 3]
-        gt_image = np.clip(gt_image, 0.0, 1.0)
+        resized_image = cv2.cvtColor(resized_image, cv2.COLOR_BGR2RGB)  # BGR转RGB
+        resized_image = resized_image[crop_cy:, :, :]  # 裁剪天空
+        gt_image = (np.asarray(resized_image) / 255.0).astype(np.float32)  # 归一化到[0,1]
+        gt_image = np.clip(gt_image, 0.0, 1.0)  # 限制范围
         width, height = gt_image.shape[1], gt_image.shape[0]
 
+        # 处理语义标签（KITTI总是使用标签）
         label_path = os.path.join(self.image_dir, self.label_filenames_all[idx])
         label = cv2.imread(label_path, cv2.IMREAD_UNCHANGED)
         resized_label = cv2.resize(label, dsize=self.resized_image_size, interpolation=cv2.INTER_NEAREST)
         mask, label = self.label2mask(resized_label)
         label = self.remap_semantic(label).astype(int)
-        mask = mask[crop_cy:, :]  # crop the sky
+        mask = mask[crop_cy:, :]  # 裁剪天空
         label = label[crop_cy:, :]
 
+        # 调整相机内参：考虑缩放和裁剪
         new_K = deepcopy(K)
         width_scale = self.resized_image_size[0] / origin_image_size[1]
         height_scale = self.resized_image_size[1] / origin_image_size[0]
-        new_K[0, :] *= width_scale
-        new_K[1, :] *= height_scale
-        new_K[1, 2] -= crop_cy
-        R = cam2world[:3, :3]
-        T = cam2world[:3, 3]
+        new_K[0, :] *= width_scale  # x方向缩放
+        new_K[1, :] *= height_scale  # y方向缩放
+        new_K[1, 2] -= crop_cy  # 考虑裁剪的y偏移
+        
+        # 提取外参
+        R = cam2world[:3, :3]  # 旋转矩阵
+        T = cam2world[:3, 3]   # 平移向量
 
+        # 构建样本字典
         sample = {"image": gt_image, "idx": idx, "cam_idx": cam_idx, "mask": mask, "label": label, "image_name": image_name, "R": R, "T": T, "K": new_K,
                   "W": width, "H": height}
         return sample
