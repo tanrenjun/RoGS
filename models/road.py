@@ -154,8 +154,9 @@ class Road(object):
         self.device = device
         self.resolution = config["bev_resolution"]
         self.cut_range = config["cut_range"]
+        # 获取所有轨迹点和类别信息
         all_poses, num_classes = dataset.chassis2world_unique, dataset.num_class
-        all_pose_xyz = all_poses[:, :3, 3]
+        all_pose_xyz = all_poses[:, :3, 3]  # 提取xyz坐标
         self.ref_pose = torch.from_numpy(dataset.ref_pose).float().to(device)
         min_coords = np.min(all_pose_xyz, axis=0) - self.cut_range
         max_coords = np.max(all_pose_xyz, axis=0) + self.cut_range
@@ -170,6 +171,7 @@ class Road(object):
 
         # (N, 3) (num_x, num_y)
         # vertices, self.bev_size_pixel, xy_resolution = create_hive_vertices(min_coords, max_coords, self.resolution)
+        # 创建规则矩形网格顶点，不使用蜂窝结构
         vertices, self.bev_size_pixel, xy_resolution = create_rect_vertices(min_coords, max_coords, self.resolution)
         print(f"Before cutting,  {vertices.shape[0]} vertices")
 
